@@ -1,4 +1,4 @@
-// server.js - OpenAI to NVIDIA NIM API Proxy
+// server.js - OpenAI to NVIDIA NIM API Proxy (LoreBary + JanitorAI Edition)
 const express = require('express');
 const cors = require('cors');
 const axios = require('axios');
@@ -6,7 +6,7 @@ const axios = require('axios');
 const app = express();
 const PORT = process.env.PORT || 3000;
 
-// Middleware
+// Middleware - Handling large character cards from JanitorAI
 app.use(cors());
 app.use(express.json({ limit: '50mb' }));
 app.use(express.urlencoded({ limit: '50mb', extended: true }));
@@ -15,13 +15,9 @@ app.use(express.urlencoded({ limit: '50mb', extended: true }));
 const NIM_API_BASE = process.env.NIM_API_BASE || 'https://integrate.api.nvidia.com/v1';
 const NIM_API_KEY = process.env.NIM_API_KEY;
 
-// 🔥 REASONING DISPLAY TOGGLE
 const SHOW_REASONING = true; 
-
-// 🔥 THINKING MODE TOGGLE
 const ENABLE_THINKING_MODE = true; 
 
-// Model mapping
 const MODEL_MAPPING = {
   'gpt-3.5-turbo': 'nvidia/llama-3.1-nemotron-ultra-253b-v1',
   'gpt-4': 'qwen/qwen3-coder-480b-a35b-instruct',
@@ -33,45 +29,23 @@ const MODEL_MAPPING = {
   'glm-5': 'z-ai/glm5'
 };
 
-// Health check endpoint
 app.get('/health', (req, res) => {
-  res.json({ 
-    status: 'ok', 
-    service: 'OpenAI to NVIDIA NIM Proxy', 
-    reasoning_display: SHOW_REASONING,
-    thinking_mode: ENABLE_THINKING_MODE
-  });
+  res.json({ status: 'ok', reasoning: SHOW_REASONING, thinking: ENABLE_THINKING_MODE });
 });
 
-// List models endpoint
 app.get('/v1/models', (req, res) => {
   const models = Object.keys(MODEL_MAPPING).map(model => ({
-    id: model,
-    object: 'model',
-    created: Date.now(),
-    owned_by: 'nvidia-nim-proxy'
+    id: model, object: 'model', created: Date.now(), owned_by: 'nvidia-nim-proxy'
   }));
   res.json({ object: 'list', data: models });
 });
 
-// Chat completions endpoint
 app.post('/v1/chat/completions', async (req, res) => {
   try {
     const { model, messages, temperature, max_tokens, stream } = req.body;
     
-    // 1. Model Selection Logic
-    let nimModel = MODEL_MAPPING[model];
-    if (!nimModel) {
-      // Fallback logic
-      const modelLower = model.toLowerCase();
-      if (modelLower.includes('gpt-4') || modelLower.includes('claude-opus')) {
-        nimModel = 'meta/llama-3.1-405b-instruct';
-      } else {
-        nimModel = 'meta/llama-3.1-70b-instruct';
-      }
-    }
+    let nimModel = MODEL_MAPPING[model] || 'meta/llama-3.1-70b-instruct';
     
-    // 2. Prepare Request
     const nimRequest = {
       model: nimModel,
       messages: messages,
@@ -81,16 +55,11 @@ app.post('/v1/chat/completions', async (req, res) => {
       stream: stream || false
     };
     
-    // 3. Make Request
     const response = await axios.post(`${NIM_API_BASE}/chat/completions`, nimRequest, {
-      headers: {
-        'Authorization': `Bearer ${NIM_API_KEY}`,
-        'Content-Type': 'application/json'
-      },
+      headers: { 'Authorization': `Bearer ${NIM_API_KEY}`, 'Content-Type': 'application/json' },
       responseType: stream ? 'stream' : 'json'
     });
     
-    // 4. Handle Response
     if (stream) {
       res.setHeader('Content-Type', 'text/event-stream');
       res.setHeader('Cache-Control', 'no-cache');
@@ -100,10 +69,9 @@ app.post('/v1/chat/completions', async (req, res) => {
       let reasoningStarted = false;
       
       response.data.on('data', (chunk) => {
-        // Fix: Use correct split for data chunks
         buffer += chunk.toString();
         const lines = buffer.split('\n'); 
-        buffer = lines.pop(); // Keep incomplete line in buffer
+        buffer = lines.pop(); 
 
         for (const line of lines) {
           const trimmedLine = line.trim();
@@ -120,53 +88,39 @@ app.post('/v1/chat/completions', async (req, res) => {
             const delta = data.choices?.[0]?.delta;
 
             if (delta) {
-              const content = delta.content || '';
-              const reasoning = delta.reasoning_content;
-
-              if (SHOW_REASONING) {
-                // LOGIC FIX: Robust state switching
-                if (reasoning) {
-                  // We are receiving reasoning tokens
-                  if (!reasoningStarted) {
-                    delta.content = '<think>\n' + reasoning;
-                    reasoningStarted = true;
-                  } else {
-                    delta.content = reasoning;
-                  }
-                  delete delta.reasoning_content; // Remove raw field so client uses content
-                } else if (reasoningStarted && !reasoning) {
-                  // Reasoning just stopped (or we switched to content)
-                  // We MUST close the tag now, even if content is empty
-                  delta.content = '</think>\n\n' + content;
-                  reasoningStarted = false;
+              // LOREBARY PATCH: We merge 'reasoning_content' into 'content'
+              // because LoreBary doesn't understand the reasoning field.
+              let output = "";
+              if (SHOW_REASONING && delta.reasoning_content) {
+                if (!reasoningStarted) {
+                  output = '<think>\n' + delta.reasoning_content;
+                  reasoningStarted = true;
+                } else {
+                  output = delta.reasoning_content;
                 }
+              } else if (reasoningStarted && !delta.reasoning_content) {
+                output = '</think>\n\n' + (delta.content || "");
+                reasoningStarted = false;
               } else {
-                // If reasoning is hidden, strip it completely
-                if (reasoning) {
-                   delta.content = ''; 
-                   delete delta.reasoning_content;
-                }
+                output = delta.content || "";
               }
 
-              // Only send if we actually have something to show (avoid empty updates that confuse clients)
-              if (delta.content || delta.reasoning_content === undefined) {
+              delta.content = output;
+              delete delta.reasoning_content; 
+
+              if (delta.content) {
                  res.write(`data: ${JSON.stringify(data)}\n\n`);
               }
             }
-          } catch (e) {
-            // If parsing fails, ignore this line
-          }
+          } catch (e) {}
         }
       });
       
       response.data.on('end', () => res.end());
-      response.data.on('error', (err) => {
-        console.error('Stream error:', err);
-        res.end();
-      });
+      response.data.on('error', () => res.end());
 
     } else {
-      // Non-streaming fallback
+      // Non-streaming logic
       const openaiResponse = {
         id: `chatcmpl-${Date.now()}`,
         object: 'chat.completion',
@@ -189,15 +143,10 @@ app.post('/v1/chat/completions', async (req, res) => {
     }
     
   } catch (error) {
-    console.error('Proxy error:', error.message);
-    res.status(500).json({ error: { message: error.message, type: 'server_error' } });
+    res.status(500).json({ error: { message: error.message } });
   }
 });
 
-// Catch-all
-app.all('*', (req, res) => res.status(404).json({ error: 'Not found' }));
-
 app.listen(PORT, () => {
-  console.log(`OpenAI to NVIDIA NIM Proxy running on port ${PORT}`);
-  console.log(`Reasoning: ${SHOW_REASONING}, Thinking Mode: ${ENABLE_THINKING_MODE}`);
+  console.log(`Proxy active on port ${PORT}`);
 });
